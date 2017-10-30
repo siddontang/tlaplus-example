@@ -49,13 +49,15 @@ Min(m, n) == IF m < n THEN m ELSE n
 
 SmallToBig == 
 LET poured == Min(big + small, 5) - big
-IN /\ big' = big + poured
-   /\ small' = small - poured
+IN 
+    /\ big' = big + poured
+    /\ small' = small - poured
    
 BigToSmall == 
 LET poured == Min(big + small, 3) - small
-IN /\ big' = big - poured
-   /\ small' = small + poured
+IN 
+    /\ big' = big - poured
+    /\ small' = small + poured
    
    
 
@@ -75,5 +77,5 @@ NotSolved == big /= 4
 
 =============================================================================
 \* Modification History
-\* Last modified Mon Oct 30 13:52:21 CST 2017 by tangliu
+\* Last modified Mon Oct 30 13:59:54 CST 2017 by tangliu
 \* Created Mon Oct 23 13:21:58 CST 2017 by tangliu
