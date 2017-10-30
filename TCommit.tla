@@ -2,7 +2,7 @@
 
 CONSTANTS RM
 
-VARIABLES rmState, v
+VARIABLES rmState
 
 TCTypeOK == rmState \in [RM -> {"working", "prepared", "committed", "aborted"}]
 
@@ -29,5 +29,5 @@ TCConsistent == \A rm1, rm2 \in RM : ~ /\ rmState[rm1] = "aborted"
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Oct 25 22:29:01 CST 2017 by tangliu
+\* Last modified Mon Oct 30 22:29:54 CST 2017 by tangliu
 \* Created Wed Oct 25 09:45:19 CST 2017 by tangliu
