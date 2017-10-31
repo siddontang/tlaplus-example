@@ -27,14 +27,14 @@ TMRcvPrepared(r) ==
 TMCommit ==
     /\ tmState = "init"
     /\ tmPrepared = RM
-    /\ tmState = "committed"
+    /\ tmState' = "committed"
     /\ msgs' = msgs \union {[type |-> "Commit"]}
     /\ UNCHANGED <<rmState, tmPrepared>>
 
 TMAbort ==
     /\ tmState = "init"
     /\ tmPrepared = RM
-    /\ tmState = "aborted"
+    /\ tmState' = "aborted"
     /\ msgs' = msgs \union {[type |-> "Abort"]}
     /\ UNCHANGED <<rmState, tmPrepared>>
     
@@ -67,5 +67,5 @@ TPNext ==
     
 =============================================================================
 \* Modification History
-\* Last modified Fri Oct 27 09:42:37 CST 2017 by tangliu
+\* Last modified Tue Oct 31 08:14:23 CST 2017 by tangliu
 \* Created Thu Oct 26 22:00:18 CST 2017 by tangliu
