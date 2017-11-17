@@ -1,4 +1,4 @@
------------------------------ MODULE Percolator -----------------------------
+---------------------------- MODULE Percolator ----------------------------
 
 EXTENDS Integers, Sequences, Bags, TLC
 
@@ -8,333 +8,329 @@ CONSTANTS KEY
 \* The set of client to execute a transaction
 CONSTANTS CLIENT
 
-\* ts is the timestamp for transaction. It is increased monotonically so
+\* next_ts is the timestamp for transaction. It is increased monotonically so
 \* every transaction must have a unique start and commit ts.
-VARIABLES ts
+VARIABLES next_ts
 
-\* $clientState[c] is the state of client
-VARIABLES clientState
+\* $client_state[c] is the state of client
+VARIABLES client_state
 
-\* $clientTS[c] is a record of [start: ts, commit: ts]
-VARIABLES clientTS
+\* $client_ts[c] is a record of [start: ts, commit: ts]
+VARIABLES client_ts
 
-\* $clientKeys[c] is a record of [primary: key, second: {key}]
-VARIABLES clientKey
+\* $client_keys[c] is a record of [primary: key, second: {key}]
+VARIABLES client_key
 
-\* $keyLock[k] is the lock of key. It is a record of a start ts and a primary key.
-\* If the primary key is not an empty set, the lock is a secondary key lock, otherwise, it is 
-\* a primary key lock.
-VARIABLES keyLock
+\* $key_lock[k] is the set of lock. 
+VARIABLES key_lock
 
-\* $keyWrite[k] is a sequence of committed version of the key.
-VARIABLES keyWrite
+\* $key_write[k] is a sequence of committed version of the key.
+VARIABLES key_write
 
-\* $keyData[k] is the set of multi-version data timestamp of the key. 
-VARIABLES keyData
-
-keyVars == <<keyLock, keyWrite, keyData>>
-
-EmptyLock ==[start |-> 0, primary |-> ""]
+\* $key_data[k] is the set of multi-version data timestamp of the key. 
+VARIABLES key_data
 
 Init == 
-    /\ ts = 0
-    /\ clientState = [c \in CLIENT |-> "init"]
-    /\ clientTS = [c \in CLIENT |-> [start |-> 0, commit |-> 0]]
-    /\ clientKey = [c \in CLIENT |-> [primary |-> "", second |-> {}]]
-    /\ keyLock = [k \in KEY |-> EmptyLock]
-    /\ keyWrite = [k \in KEY |-> <<>>]
-    /\ keyData = [k \in KEY |-> {}]
-    
-TypeOK ==
-    /\ ts \in Nat
-    /\ clientState \in [CLIENT -> {"init", "working", "prewriting", "committing", "aborted", "committed"}]
-    
-\* Selects a primary key from KEY, and use others as the secondary keys.
-GenKey ==     
+    /\ next_ts = 0
+    /\ client_state = [c \in CLIENT |-> "init"]
+    /\ client_ts = [c \in CLIENT |-> [start_ts |-> 0, commit_ts |-> 0]]
+    /\ client_key = [c \in CLIENT |-> [primary |-> "", secondary |-> {}]]
+    /\ key_lock = [k \in KEY |-> {}]
+    /\ key_write = [k \in KEY |-> <<>>]
+    /\ key_data = [k \in KEY |-> {}]
+
+       
+key_vars == <<key_lock, key_write, key_data>>
+client_txn_vars == <<client_ts, client_key>>
+
+
+\* Check whether there is a lock which start ts is less or equal than start_ts.
+hasLockLE(k, start_ts) == 
+    {l \in key_lock[k] : l.start_ts <= start_ts} /= {}
+
+\* Check whether there is a lock with start ts or not.
+hasLockEQ(k, start_ts) ==
+     {l \in key_lock[k] : l.start_ts <= start_ts} /= {}
+     
+\* Select a primary key and use the rest for the secondary key
+chooseKey ==
     LET
-        \* TODO: How to select a primary key randomly?
         primary == CHOOSE k \in KEY: TRUE
     IN
-        [primary |-> primary, second |-> KEY \ {primary}]
+        [primary |-> primary, secondary |-> KEY \ {primary}]
 
-\* Starts a transaction in one client.
-Start(c) == 
-    /\ clientState[c] = "init"
-    /\ clientState' = [clientState EXCEPT ![c] = "working"]
-    /\ ts' = ts + 1
-    /\ clientTS' = [clientTS EXCEPT ![c] = [start |-> ts', commit |-> 0]]
-    /\ clientKey' = [clientKey EXCEPT ![c] = GenKey]
-    /\ UNCHANGED<<keyVars>>   
-    
+\* Return TRUE means the client meets no lock and can does pre-write.     
+canPrewrite(c) == 
+     LET 
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary
+     IN
+        /\ ~hasLockLE(primary, start_ts)
+        /\ \A k \in secondary : 
+            /\ ~hasLockLE(k, start_ts)
+           
+\* Return TRUE means a lock can be cleanup up if:
+\*  1. The lock is a primary lock and the start ts is less than start_ts.
+\*  2. Or the lock is a secondary lock and the associated primary key is cleaned up. 
+\* Notice: Percolator paper doesn't explain how to clean up the lock, here we just use 
+\* a simple way.
+isStaleLock(l, start_ts) ==            
+    \/ /\ l.primary = ""
+       /\ l.start_ts < start_ts
+    \/ /\ l.primary /= ""
+       /\ ~hasLockEQ(l.primary, l.start_ts) 
+   
+\* Return TRUE if we have a stale lock for key.
+hasStaleLock(k, start_ts) ==
+    \A l \in key_lock[k] :
+        \/ isStaleLock(l, start_ts)                       
+           
+\* Return TRUE means the client can clean up a stale lock
+canCleanup(c) == 
+     LET 
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary
+     IN
+        /\ ~hasStaleLock(primary, start_ts)
+        /\ \A k \in secondary : 
+            /\ ~hasStaleLock(k, start_ts) 
+            
 \* Find write with start ts.
-FindWriteWithStart(k, t) ==
-    LET select(w) == w.start = t
-    IN  SelectSeq(keyWrite[k], select)            
-        
+findWriteWithStart(k, start_ts) ==
+    SelectSeq(key_write[k], LAMBDA w : w.start_ts = start_ts)  
 
-\* Returns TRUE when any key is not locked.
-CanPrewrite(c) == 
+\* Clean up a stale lock and its data. If the lock is a secondary lock
+\* and the assoicated primary lock is cleaned up, we can clean up the lock and do:
+\* 1. If the primary key is committed, we must also commit the secondary key
+\* 2. Otherwise, clean up the stale data too
+cleanupStaleLock(k, start_ts) == 
     LET
-        primary == clientKey[c].primary
-        second == clientKey[c].second
+        \* Find a stale lock at first
+        l == CHOOSE l \in key_lock[k] : isStaleLock(l, start_ts)
     IN
-        /\ keyLock[primary] = EmptyLock
-        /\ \A k \in second : 
-            /\ keyLock[k] = EmptyLock        
-                        
-\* Returns TRUE if the client can clean up the lock
-CanCleanupLock(startTS, k) == 
-    /\ keyLock[k] /= EmptyLock
-    /\ keyLock[k].start < startTS \* Can clean up any previous lock  
-    /\ \/ keyLock[k].primary = ""
-       \* If the primary key of the second lock key is empty, 
-       \* we can clean up the second lock key
-       \/ keyLock[keyLock[k].primary] = EmptyLock
+        /\ key_lock' = key_lock \ {l}
+        /\ \/ /\ l.primary = ""
+              /\ key_data' = key_data \ {l.start_ts}
+              /\ UNCHANGED <<key_write>>
+           \/ /\ l.primary /= ""
+              /\ LET
+                    w == findWriteWithStart(l.primary, l.start_ts)
+                 IN
+                    IF Len(w) = 0 
+                    THEN
+                        \* The primary key is not committed, clean up the data
+                        /\ key_data' = key_data \ {l.start_ts}
+                        /\ UNCHANGED <<key_write>>
+                    ELSE
+                        \* The primary key is committed, commit the secondary key
+                        /\ key_write' = Append(key_write, w[1])
+                        /\ UNCHANGED <<key_data>>
 
-CanCleanup(c) ==
+\* Clean up a stale lock when the client meets.
+cleanup(c) == 
     LET
-        startTS == clientTS[c].start 
-        primary == clientKey[c].primary
-        second == clientKey[c].second  
-    IN
-        /\ CanCleanupLock(startTS, primary)
-        /\ \A k \in second :
-            /\ CanCleanupLock(startTS, k)
-
-\* Returns the information which we need to clean up the lock.
-GetCleanupInfo(oldLock, k, c) ==
-    LET
-        startTS == clientTS[c].start 
-        primary == clientKey[c].primary
-        second == clientKey[c].second  
-    IN
-    IF
-        /\ k = primary \/ k \in second 
-        /\ oldLock.start /= 0
-        /\ oldLock.start < startTS \* Can clean up any previous lock  
-    THEN
-        IF oldLock.primary /= "" 
-        THEN 
-            \* The lock is a primary key lock.
-            <<EmptyLock>>
-        ELSE
-            LET 
-                lockTS == oldLock.start
-                w == FindWriteWithStart(oldLock.primary, lockTS)
-            IN
-                \* If the associated primary lock is clean up, we must find the write for the primary key
-                \* and then append to the write of the second key
-                IF keyLock[oldLock.primary].start = 0 
-                THEN
-                    <<EmptyLock, w[1]>>
-                ELSE <<>>        
-    ELSE
-        <<>>
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary
+        meetStaleLock(k) == /\ \/ k = primary 
+                               \/ k \in secondary
+                            /\ hasStaleLock(k, start_ts)   
+        k == CHOOSE k \in KEY : meetStaleLock(k)
+     IN
+        cleanupStaleLock(k, start_ts)
         
-CleanupLock(oldLock, k, infos) ==
-    IF infos[k] /= <<>>
-    THEN
-        infos[k][1]
-    ELSE
-        oldLock
-        
-CleanupWrite(oldWrite, k, infos) ==
-    IF Len(infos[k]) = 2
-    THEN
-        Append(oldWrite, infos[k][2])
-    ELSE
-        oldWrite
-                
-Cleanup(c) ==
+\* Return TURE means there is no lock for key and no any newer write.
+canLockKey(k, start_ts) ==    
     LET
-        infos == [k \in DOMAIN keyLock |-> GetCleanupInfo(keyLock[k], k, c)]
+        writes == {w \in DOMAIN key_write[k] : key_write[k][w].commit_ts >= start_ts}
     IN
-    /\ keyLock' = [k \in DOMAIN keyLock |-> CleanupLock(keyLock[k], k, infos)]
-    /\ keyWrite' = [k \in DOMAIN keyWrite |-> CleanupWrite(keyWrite[k], k, infos)]
-    
-              
-\* Get checks whether the key is already locked, if the key is locked, 
-\* The transaction will abort or try to clean up the lock then restart.        
-Get(c) ==
-    /\ clientState[c] = "working"
-    /\ 
-        IF CanPrewrite(c)    
-        THEN
-            /\ clientState' = [clientState EXCEPT ![c] = "prewriting"]
-            /\ UNCHANGED <<keyWrite, keyLock>>
-        ELSE             
-            IF CanCleanup(c)
-            THEN
-                \* If we clean up any old lock, we can retry running next time
-                 /\ Cleanup(c)
-                 /\ UNCHANGED <<ts, clientState>>
-            ELSE  
-                /\ clientState' = [clientState EXCEPT ![c] = "aborted"]
-                /\ UNCHANGED <<ts, keyWrite, keyLock>>
-    /\ UNCHANGED <<ts, keyData, clientTS, clientKey>>
-    
-CanLockKey(c, k, primary) ==    
-    LET
-        startTS == clientTS[c].start
-        writes == {w \in DOMAIN keyWrite[k] : keyWrite[k][w].commit >= startTS}
-    IN
-        \* No any transaction locks the key
-        /\ keyLock[k] = EmptyLock 
+        \* No any lock for the key
+        /\ key_lock[k] = {} 
         \* No any newer write
         /\ writes = {} 
        
-\* CanLock returns whether the transaction can lock all keys    
-CanLock(c) ==
+\* Return whether the client can lock all keys    
+canLock(c) ==
     LET
-        primary == clientKey[c].primary
-        second == clientKey[c].second  
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary 
     IN
-        /\ CanLockKey(c, primary, "")
-        /\ \A k \in second :
-           /\ CanLockKey(c, k, primary)
+        /\ canLockKey(primary, start_ts)
+        /\ \A k \in secondary :
+           /\ canLockKey(k, start_ts)
 
-LockKey(oldLock, k, c) ==
-    LET
-        primary == clientKey[c].primary
-        second == clientKey[c].second  
-        startTS == clientTS[c].start
-    IN
-        IF k = primary 
-        THEN
-            [start |-> startTS, primary |-> ""]
-        ELSE
-            IF k \in second 
-            THEN
-                [start |-> startTS, primary |-> primary]
-            ELSE
-                oldLock
+\* Lock the key and save the data
+lockKey(k, start_ts, primary) ==
+    /\ key_lock' = [key_lock EXCEPT ![k] = @ \UNION {[start_ts |-> start_ts, primary |-> primary]}]
+    /\ key_data' = [key_data EXCEPT ![k] = @ \UNION {start_ts}]
+    /\ UNCHANGED <<key_write>>
     
-CommitData(data, k, c) ==
-    LET
-        primary == clientKey[c].primary
-        second == clientKey[c].second  
-        startTS == clientTS[c].start
-    IN
-        IF k = primary \/ k \in second 
-        THEN
-            data \UNION {startTS}
-        ELSE
-            data
-            
 
-Lock(c) == 
-    /\ keyLock' = [k \in DOMAIN keyLock |-> LockKey(keyLock[k], k, c)]
-    /\ keyData' = [k \in DOMAIN keyData |-> CommitData(keyData[k], k, c)]
+\* Try to lock primary key first, then the secondary key            
+lock(c) == 
+    LET
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary        
+     IN
+        IF hasLockEQ(primary, start_ts)
+        THEN
+            lockKey(primary, start_ts, "")
+        ELSE
+            \* primary key has already been locked, we must choose the a secondary key to lock
+            LET
+                k == CHOOSE k \in secondary : canLockKey(k, start_ts)
+            IN
+                lockKey(k, start_ts, primary)           
+           
+\* Return TRUE when the client locks all keys
+canCommit(c) == 
+    LET
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+        secondary == client_key[c].secondary
+    IN
+        /\ hasLockEQ(primary, start_ts)
+        /\ \A k \in secondary : 
+            /\ hasLockEQ(k, start_ts)
+
+\* Return TRUE mean we can commit the primary key.
+canCommitPrimary(c) ==
+    LET
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+    IN
+        hasLockEQ(primary, start_ts)
+        
+\* Commit the primary key.       
+commitPrimary(c) == 
+    LET
+        start_ts == client_ts[c].start_ts
+        primary == client_key[c].primary
+    IN
+        /\ key_write' = [key_write EXCEPT ![primary] = Append(@, client_ts[c])]
+        /\ key_lock' = [key_lock EXCEPT ![primary] = @ \ {start_ts}] 
+            
+Start(c) ==
+    /\ client_state[c] = "init"
+    /\ client_state' = [client_state EXCEPT ![c] = "working"]
+    /\ next_ts' = next_ts + 1
+    /\ client_ts' = [client_ts EXCEPT ![c] = [@ EXCEPT !.start_ts = next_ts']]
+    /\ client_key' = [client_key EXCEPT ![c] = chooseKey]
+    /\ UNCHANGED <<key_vars>>
+
+Get(c) ==
+    /\ client_state[c] = "working"
+    /\ 
+        IF canPrewrite(c)
+        THEN 
+           /\ client_state' = [client_state EXCEPT ![c] = "prewriting"]      
+           /\ UNCHANGED <<key_vars, client_txn_vars, next_ts>>
+        ELSE
+            IF canCleanup(c)
+            THEN
+                /\ cleanup(c)   
+                /\ UNCHANGED <<client_state, client_txn_vars, next_ts>>
+            ELSE
+                /\ client_state' = [client_state EXCEPT ![c] = "aborted"]
+                /\ UNCHANGED <<key_vars, client_txn_vars, next_ts>>
 
 Prewrite(c) ==
-    /\ clientState[c] = "prewriting"
-    /\ 
-        IF CanLock(c)
-        THEN
-            /\ Lock(c)
-            /\ ts' = ts + 1
-            /\ clientTS' = [clientTS EXCEPT ![c] = [@ EXCEPT !.commit = ts']]
-            /\ clientState' = [clientState EXCEPT ![c] = "committing"]
-        ELSE           
-            /\ clientState' = [clientState EXCEPT ![c] = "aborted"]
-            /\ UNCHANGED <<ts, clientTS, clientKey, keyLock, keyData>>
-    /\ UNCHANGED<<keyWrite, clientKey>>
-
-CommitPrimary(c) ==
-    LET 
-        startTS == clientTS[c].start
-        commitTS == clientTS[c].commit    
-        primary == clientKey[c].primary
-        w == [start |-> startTS, commit |-> commitTS]
-    IN
-        /\ keyLock[primary].start = startTS 
-        /\ keyWrite' = [keyWrite EXCEPT ![primary] = Append(@, w)]
-        /\ keyLock' = [keyLock EXCEPT ![primary] = EmptyLock]
-
-Commit(c) == 
-    /\ clientState[c] = "committing"
-    /\ 
-        LET
-            startTS == clientTS[c].start
-            commitTS == clientTS[c].commit    
-            primary == clientKey[c].primary
-            w == [start |-> startTS, commit |-> commitTS]
-        IN
-            IF 
-                keyLock[primary].start = startTS
+    /\ client_state[c] = "prewriting"
+    /\ IF canCommit(c)
+       THEN
+            /\ next_ts' = next_ts + 1
+            /\ client_ts' = [client_ts EXCEPT ![c] = [@ EXCEPT !.commit_ts = next_ts']]
+            /\ client_state' = [client_state EXCEPT ![c] = "committing"]      
+            /\ UNCHANGED <<key_vars, client_key, next_ts>>
+       ELSE
+            IF canLock(c) 
             THEN
-                /\ keyWrite' = [keyWrite EXCEPT ![primary] = Append(@, w)]
-                /\ keyLock' = [keyLock EXCEPT ![primary] = [start |-> 0, primary |-> ""]]
-                /\ clientState' = [clientState EXCEPT ![c] = "committed"]
-                \* If we commit primary successfully, we can think the transaction is committed
-                \* TODO: use async message to commit second keys
+                /\ lock(c)
+                /\ UNCHANGED <<client_state, client_txn_vars, next_ts>>
             ELSE
-                /\ clientState' = [clientState EXCEPT ![c] = "aborted"]
-                /\ UNCHANGED<<keyLock, keyWrite>>
-    /\ UNCHANGED<<ts, keyData, clientTS, clientKey>>
-            
-            
+                /\ client_state' = [client_state EXCEPT ![c] = "aborted"]      
+                /\ UNCHANGED <<key_vars, client_txn_vars, next_ts>>
+
+Commit(c) ==
+    /\ client_state[c] = "committing"
+    /\ IF canCommitPrimary(c)
+       THEN
+            /\ commitPrimary(c)
+            /\ client_state' = [client_state EXCEPT ![c] = "committed"] 
+            /\ UNCHANGED <<key_data, client_txn_vars, next_ts>>
+            \* If we commit primary successfully, we can think the transaction is committed
+            \* TODO: use async message to commit second keys
+       ELSE
+            /\ client_state' = [client_state EXCEPT ![c] = "aborted"]      
+            /\ UNCHANGED <<key_vars, client_txn_vars, next_ts>>
 Next == 
-    \E c \in CLIENT : 
+    \E c \in CLIENT:
         Start(c) \/ Get(c) \/ Prewrite(c) \/ Commit(c)
+     
 
-CheckWriteOrder(w1, w2) ==
-    /\ w1.commit < w2.commit
-    /\ w1.start < w2.start
-    /\ w1.start < w1.commit
+checkWriteOrder(w1, w2) ==
+    /\ w1.commit_ts < w2.commit_ts
+    /\ w1.start_ts < w2.start_ts
+    /\ w1.start_ts < w1.commit_ts
 
-\* The committed ts of the key must be in order.
+
+\* The committed write timestamp of the key must be in order.
 WriteConsistency ==
     \A k \in KEY :
-        IF Len(keyWrite[k]) > 1 
+        IF Len(key_write[k]) > 1 
         THEN
             LET
-                newWrite == [n \in 1..Len(keyWrite[k]) - 1 |-> CheckWriteOrder(keyWrite[k][n], keyWrite[k][n + 1])]
+                ws == [n \in 1..Len(key_write[k]) - 1 |-> checkWriteOrder(key_write[k][n], key_write[k][n + 1])]
             IN
-                ~ FALSE \in newWrite
+                ~ FALSE \in ws
         ELSE
-            IF Len(keyWrite[k]) = 1 
+            IF Len(key_write[k]) = 1 
             THEN
-                keyWrite[k][1].start < keyWrite[k][1].commit
+                key_write[k][1].start_ts < key_write[k][1].commit_Ts
             ELSE
-                TRUE    
+                TRUE  
 
-\* Find write with commit ts.
-FindWriteWithCommit(k, t) ==
-    LET select(w) == w.commit = t
-    IN  SelectSeq(keyWrite[k], select)            
-             
+\* find write with commit ts.
+findWriteWithCommit(k, commit_ts) ==
+    SelectSeq(key_write[k], LAMBDA w : w.commit_ts = commit_ts) 
+
 CommittedConsistency == 
     \A c \in CLIENT :
     LET 
-        startTS == clientTS[c].start
-        commitTS == clientTS[c].commit
-        primary == clientKey[c].primary
-        second == clientKey[c].second
-        w == [start |-> startTS, commit |-> commitTS]
+        start_ts == client_ts[c].start
+        commit_ts == client_ts[c].commit
+        primary == client_key[c].primary
+        secondary == client_key[c].second
+        w == [start |-> start_ts, commit |-> commit_ts]
     IN  
-        \/ /\ clientState[c] = "committed"
-           \* The primary key lock must be empty or locked by a newer transaction.
-           /\ \/ keyLock[primary] = EmptyLock 
-              \/ keyLock[primary].start > commitTS
-           /\ FindWriteWithCommit(primary, commitTS) = <<w>>
-           /\ {startTS} \in keyData[primary]
-           /\ \A k \in second :
-              \* The second key lock can be empty or not.
-              /\ \/ /\ keyLock[k] = EmptyLock
-                    /\ FindWriteWithCommit(k, commitTS) = <<w>>
-                 \/ keyLock[k].start = startTS
-                    /\ FindWriteWithCommit(k, commitTS) = <<>>
+        \/ /\ client_state[c] = "committed"
+           \* The primary key lock must be cleaned up, and no any older lock.
+           /\ ~hasLockLE(primary, start_ts) 
+           /\ findWriteWithCommit(primary, commit_ts) = <<w>>
+           /\ {start_ts} \in key_data[primary]
+           /\ \A k \in secondary :
+              \* The secondary key lock can be empty or not.
+              /\ \/ /\ ~hasLockEQ(k, start_ts)
+                    /\ findWriteWithCommit(k, commit_ts) = <<w>>
+                    /\ ~hasLockLE(k, start_ts - 1)
+                 \/ /\ hasLockEQ(k, start_ts)
+                    /\ findWriteWithCommit(k, commit_ts) = <<>>
                     /\ 
-                        IF Len(keyWrite[k]) > 0 
+                        IF Len(key_write[k]) > 0 
                         THEN
-                            keyWrite[k][Len(keyWrite[k])].commit < startTS
+                            \* Lock has not been cleaned up, so the last write committed 
+                            \* timestamp must be less than lock start ts.
+                            key_write[k][Len(key_write[k])].commit_ts < start_ts
                         ELSE
                             TRUE
-              /\ {startTS} \in keyData[k]
+              /\ {start_ts} \in key_data[k]
         \/ TRUE
-        
+
 =============================================================================
 \* Modification History
-\* Last modified Sun Nov 05 21:26:26 CST 2017 by tangliu
-\* Created Sat Nov 04 09:40:10 CST 2017 by tangliu
+\* Last modified Fri Nov 17 16:40:19 CST 2017 by tangliu
+\* Created Fri Nov 17 08:55:33 CST 2017 by tangliu
