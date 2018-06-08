@@ -61,8 +61,6 @@ IN
    
 Next ==
     \/ FillBig
-    \/ EmptySmall
-    \/ EmptyBig
     \/ BigToSmall
     \/ EmptySmall
     \/ BigToSmall
