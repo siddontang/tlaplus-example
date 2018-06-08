@@ -59,21 +59,23 @@ IN
     /\ big' = big - poured
     /\ small' = small + poured
    
-   
-
-Next == 
-    \/ FillSmall
+Next ==
     \/ FillBig
     \/ EmptySmall
     \/ EmptyBig
-    \/ SmallToBig
     \/ BigToSmall
-                      
+    \/ EmptySmall
+    \/ BigToSmall
+    \/ FillBig
+    \/ BigToSmall
+
 TypeOK == 
     /\ big \in 0..5
     /\ small \in 0..3
           
 NotSolved == big /= 4
+
+Spec == Init /\ [][Next]_<<big, small>>
 
 =============================================================================
 \* Modification History
